@@ -1,0 +1,1 @@
+function togglePassword(id){const el=document.getElementById(id);if(el)el.type=el.type==='password'?'text':'password'}document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('input[type=date]').forEach(x=>x.addEventListener('change',()=>x.classList.toggle('has-value',!!x.value)));});

@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block title %}{{ code }} · EFMS{% endblock %}{% block content %}<div class="center-card"><div class="icon-bubble">!</div><span class="eyebrow">SOMETHING WENT OFF TRACK</span><h1>{{ code }}</h1><p>{{ message }}</p><a class="btn btn-primary" href="{{ url_for('index') }}">Return to EFMS</a></div>{% endblock %}

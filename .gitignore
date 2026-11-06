@@ -1,0 +1,11 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.log
+static/uploads/profiles/*
+!static/uploads/profiles/.gitkeep
+*.db-wal
+*.db-shm
+
+efms.db
