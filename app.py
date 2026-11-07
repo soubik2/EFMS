@@ -131,6 +131,14 @@ def init_db():
     conn = db()
     schema = SCHEMA_PATH.read_text(encoding='utf-8')
     conn.executescript(schema)
+    # Ensure the roles table exists before seed() runs.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS roles (
+            role_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT
+        )
+    """)
     # Safe in-place migrations for databases created by the previous prototype.
     user_cols = {r['name'] for r in conn.execute('PRAGMA table_info(users)')}
     if 'email_verified' not in user_cols: conn.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1')
