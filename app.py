@@ -1,7 +1,8 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, abort, send_file, Response
 import sqlite3
-import csv, io, secrets, os, smtplib, hashlib, hmac, json
-from email.message import EmailMessage
+import csv, io, secrets, os, hashlib, hmac, json
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from datetime import timedelta
 from pathlib import Path
 from functools import wraps
@@ -65,52 +66,51 @@ GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '').strip()
 GOOGLE_REDIRECT_URI = os.getenv('GOOGLE_REDIRECT_URI', f"{APP_BASE_URL}/auth/google/callback").strip()
 RAZORPAY_KEY_ID = os.getenv('RAZORPAY_KEY_ID', '').strip()
 RAZORPAY_KEY_SECRET = os.getenv('RAZORPAY_KEY_SECRET', '').strip()
-SMTP_HOST = os.getenv('SMTP_HOST', '').strip()
-SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
-SMTP_USER = os.getenv('SMTP_USER', '').strip()
-SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '').strip()
-SMTP_FROM = os.getenv('SMTP_FROM', SMTP_USER).strip()
-SMTP_USE_TLS = os.getenv('SMTP_USE_TLS', 'true').strip().lower() not in ('0', 'false', 'no')
-SMTP_TIMEOUT = int(os.getenv('SMTP_TIMEOUT', '20'))
+# Transactional email is sent through Resend's HTTPS API. This avoids
+# SMTP ports, which are commonly blocked on hosted application platforms.
+RESEND_API_KEY = os.getenv('RESEND_API_KEY', '').strip()
+EMAIL_FROM = os.getenv('EMAIL_FROM', 'onboarding@resend.dev').strip()
+EMAIL_API_TIMEOUT = int(os.getenv('EMAIL_API_TIMEOUT', '20'))
 
-def smtp_configured():
-    return bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD and SMTP_FROM)
+def email_configured():
+    return bool(RESEND_API_KEY and EMAIL_FROM)
 
 def send_email(to_email, subject, body):
-    if not smtp_configured():
-        return False
-    msg = EmailMessage(); msg['Subject'] = subject; msg['From'] = SMTP_FROM; msg['To'] = to_email; msg.set_content(body)
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-        if SMTP_USE_TLS: server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-    return True
+    if not email_configured():
+        raise RuntimeError('Resend is not configured. Set RESEND_API_KEY and EMAIL_FROM in the deployment environment.')
+
+    payload = json.dumps({
+        'from': EMAIL_FROM,
+        'to': [to_email],
+        'subject': subject,
+        'text': body,
+    }).encode('utf-8')
+    req = Request(
+        'https://api.resend.com/emails',
+        data=payload,
+        headers={
+            'Authorization': f'Bearer {RESEND_API_KEY}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'EFMS/1.0',
+        },
+        method='POST',
+    )
+    try:
+        with urlopen(req, timeout=EMAIL_API_TIMEOUT) as response:
+            result = json.loads(response.read().decode('utf-8') or '{}')
+            print('Resend accepted email request:', result.get('id', 'accepted'))
+            return True
+    except HTTPError as exc:
+        detail = exc.read().decode('utf-8', errors='replace')[:1000]
+        raise RuntimeError(f'Resend API returned HTTP {exc.code}: {detail}') from exc
+    except URLError as exc:
+        raise RuntimeError(f'Could not connect to Resend API: {exc.reason}') from exc
 
 def send_email_otp(user_id, email):
-    # Deliver first; never create an OTP record if SMTP is unavailable or rejects it.
     code = f'{secrets.randbelow(1_000_000):06d}'
-    sent = send_email(
-        email,
-        'EFMS email verification code',
-        f'Your EFMS verification code is {code}. It expires in 10 minutes. '
-        'If you did not request this, ignore this email.'
-    )
-    if not sent:
-        raise RuntimeError('SMTP is not configured. Check SMTP settings in your private .env file.')
-    conn = db()
-    try:
-        now = datetime.utcnow()
-        conn.execute(
-            'UPDATE email_otps SET used_at=? WHERE user_id=? AND used_at IS NULL',
-            (now.isoformat(), user_id)
-        )
-        conn.execute(
-            'INSERT INTO email_otps(user_id,code_hash,expires_at) VALUES (?,?,?)',
-            (user_id, generate_password_hash(code), (now + timedelta(minutes=10)).isoformat())
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    digest = generate_password_hash(code)
+    execute('INSERT INTO email_otps(user_id,code_hash,expires_at) VALUES (?,?,?)', (user_id,digest,(datetime.utcnow()+timedelta(minutes=10)).isoformat()))
+    send_email(email, 'EFMS email verification code', f'Your EFMS verification code is {code}. It expires in 10 minutes. If you did not request this, ignore this email.')
 
 
 oauth = OAuth(app) if OAuth else None
@@ -120,10 +120,9 @@ if oauth and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
                    client_kwargs={'scope':'openid email profile'})
 
 def db():
-    conn = sqlite3.connect(app.config['DATABASE'], timeout=15)
+    conn = sqlite3.connect(app.config['DATABASE'])
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys = ON')
-    conn.execute('PRAGMA busy_timeout = 15000')
     return conn
 
 
@@ -131,19 +130,12 @@ def init_db():
     conn = db()
     schema = SCHEMA_PATH.read_text(encoding='utf-8')
     conn.executescript(schema)
-    # Ensure the roles table exists before seed() runs.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS roles (
-            role_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            description TEXT
-        )
-    """)
+    # Ensure roles exists before seed() references it (older deployed DBs may lack it).
+    conn.execute('CREATE TABLE IF NOT EXISTS roles (role_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT)')
     # Safe in-place migrations for databases created by the previous prototype.
     user_cols = {r['name'] for r in conn.execute('PRAGMA table_info(users)')}
     if 'email_verified' not in user_cols: conn.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1')
     conn.execute('CREATE TABLE IF NOT EXISTS email_otps (otp_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE)')
-    conn.execute('CREATE TABLE IF NOT EXISTS password_reset_otps (reset_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE)')
     conn.execute("CREATE TABLE IF NOT EXISTS user_profiles (profile_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, profile_photo TEXT, bio TEXT, date_of_birth TEXT, address TEXT, college TEXT, department TEXT, organization_name TEXT, website TEXT, education TEXT, experience TEXT, skills TEXT, availability TEXT, emergency_contact TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE)")
     conn.execute('INSERT OR IGNORE INTO user_profiles(user_id) SELECT user_id FROM users')
     payment_cols = {r['name'] for r in conn.execute('PRAGMA table_info(payments)')}
@@ -323,14 +315,7 @@ def audit(action, entity_type, entity_id=None, details=''):
 
 @app.context_processor
 def inject_globals():
-    photo = None
-    if session.get('user_id'):
-        try:
-            row = query('SELECT profile_photo FROM user_profiles WHERE user_id=?', (session['user_id'],), one=True)
-            photo = row['profile_photo'] if row else None
-        except Exception:
-            photo = None
-    return {'current_year': datetime.now().year, 'nav_profile_photo': photo}
+    return {'current_year': datetime.now().year}
 
 
 @app.route('/')
@@ -348,7 +333,7 @@ def login():
         password = request.form.get('password','')
         user = query('SELECT u.*, r.name role_name FROM users u JOIN roles r ON r.role_id=u.role_id WHERE lower(u.email)=?', (email,), one=True)
         if user and check_password_hash(user['password_hash'], password):
-            if not user['email_verified']:
+            if email_configured() and not user['email_verified']:
                 flash('Please verify your email before signing in. Enter your email on the verification page.', 'warning')
                 return redirect(url_for('verify_email', email=user['email']))
             session.clear()
@@ -521,7 +506,7 @@ def registrations():
 @role_required('Admin','Organizer','Participant')
 def create_registration():
     d=request.form
-    user_id=int(d['user_id']) if session.get('role')=='Admin' and d.get('user_id') else session['user_id']
+    user_id=session['user_id'] if session['role']=='Participant' else int(d['user_id'])
     conn=db()
     try:
         p=conn.execute('SELECT participant_id FROM participants WHERE user_id=?',(user_id,)).fetchone()
@@ -532,7 +517,6 @@ def create_registration():
         event_id=int(d['event_id']); ticket_type_id=int(d['ticket_type_id']); qty=max(1,int(d.get('quantity') or 1))
         event_row=conn.execute('SELECT * FROM events WHERE event_id=?',(event_id,)).fetchone()
         if not event_row or event_row['status']!='Published': raise ValueError('This event is not approved for registration yet.')
-        if event_row['organizer_user_id'] == user_id: raise ValueError('An event host cannot register as a participant in their own event.')
         if event_row['registration_deadline'] and event_row['registration_deadline'] < datetime.now().strftime('%Y-%m-%d'): raise ValueError('The registration deadline has passed.')
         current_count=conn.execute("SELECT COUNT(*) c FROM registrations WHERE event_id=? AND status IN ('Pending','Approved')",(event_id,)).fetchone()['c']
         if event_row['max_participants'] and current_count+qty>event_row['max_participants']: raise ValueError('Event capacity is full. Join the waitlist from Parking & Safety Hub.')
@@ -710,19 +694,14 @@ def create_feedback():
 @app.route('/reports')
 @login_required
 def reports():
-    # Convert sqlite3.Row objects to ordinary dictionaries before passing
-    # them to Jinja. The reports template calls stats.items(), row.keys()
-    # and row[key], which are consistently supported by dictionaries.
-    stats_row = query('''SELECT
+    stats=query('''SELECT
         (SELECT COUNT(*) FROM festivals) festivals,
         (SELECT COUNT(*) FROM events) events,
         (SELECT COUNT(*) FROM registrations) registrations,
         (SELECT COUNT(*) FROM attendance WHERE status='Present') attendance,
         (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='Success') revenue,
         (SELECT COALESCE(SUM(amount),0) FROM sponsorships WHERE status='Active') sponsorship''', one=True)
-    stats = dict(stats_row) if stats_row is not None else {}
-
-    event_rows = query('''SELECT e.event_name,f.festival_name,COUNT(DISTINCT r.registration_id) registrations,
+    event_report=query('''SELECT e.event_name,f.festival_name,COUNT(DISTINCT r.registration_id) registrations,
                                  COALESCE(SUM(p.amount),0) revenue,COUNT(DISTINCT a.attendance_id) attendance,
                                  ROUND(COALESCE(AVG(fe.rating),0),2) rating
                           FROM events e JOIN festivals f ON f.festival_id=e.festival_id
@@ -731,19 +710,10 @@ def reports():
                           LEFT JOIN attendance a ON a.registration_id=r.registration_id
                           LEFT JOIN feedback fe ON fe.event_id=e.event_id
                           GROUP BY e.event_id ORDER BY registrations DESC''')
-    event_report = [dict(row) for row in event_rows]
-
-    venue_rows = query('''SELECT v.venue_name, v.capacity, COUNT(es.schedule_id) bookings
+    venue_report=query('''SELECT v.venue_name, v.capacity, COUNT(es.schedule_id) bookings
                          FROM venues v LEFT JOIN event_schedules es ON es.venue_id=v.venue_id
                          GROUP BY v.venue_id ORDER BY bookings DESC''')
-    venue_report = [dict(row) for row in venue_rows]
-
-    return render_template(
-        'reports.html',
-        stats=stats,
-        event_report=event_report,
-        venue_report=venue_report
-    )
+    return render_template('reports.html',stats=stats,event_report=event_report,venue_report=venue_report)
 
 
 # Lightweight API endpoints for dynamic frontend
@@ -989,32 +959,8 @@ def export_report(report_type):
     return Response('\ufeff'+output.getvalue(),mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename='+filename})
 
 # Self-service profile editing and profile-photo upload.
-def allowed_profile_image(filename, file_storage=None):
-    if not filename or '.' not in filename:
-        return False
-    extension = filename.rsplit('.', 1)[1].lower()
-    if extension not in ALLOWED_PROFILE_EXTENSIONS or file_storage is None:
-        return False
-    try:
-        from PIL import Image
-        file_storage.stream.seek(0)
-        with Image.open(file_storage.stream) as image:
-            image.verify()
-            detected = (image.format or '').lower()
-        file_storage.stream.seek(0)
-        allowed_formats = {
-            'png': {'png'},
-            'jpg': {'jpeg'},
-            'jpeg': {'jpeg'},
-            'webp': {'webp'},
-        }
-        return detected in allowed_formats.get(extension, set())
-    except Exception:
-        try:
-            file_storage.stream.seek(0)
-        except Exception:
-            pass
-        return False
+def allowed_profile_image(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_PROFILE_EXTENSIONS
 
 @app.route('/profile', methods=['GET', 'POST'])
 @login_required
@@ -1037,7 +983,7 @@ def edit_profile():
             photo_path = profile['profile_photo']
             photo = request.files.get('profile_photo')
             if photo and photo.filename:
-                if not allowed_profile_image(photo.filename, photo):
+                if not allowed_profile_image(photo.filename):
                     flash('Use a PNG, JPG, JPEG or WEBP profile photo.', 'danger')
                     return redirect(url_for('edit_profile'))
                 ext = secure_filename(photo.filename).rsplit('.', 1)[1].lower()
@@ -1069,17 +1015,18 @@ def edit_profile():
 
 # Self-service account and role-specific portal routes.
 @app.route('/register', methods=['GET', 'POST'])
-@app.route('/register', methods=['GET', 'POST'])
 @app.route('/signup', methods=['GET', 'POST'])
 def self_register():
     if request.method == 'POST':
-        d=request.form; name=d.get('name','').strip(); email=d.get('email','').strip().lower(); phone=d.get('phone','').strip(); password=d.get('password',''); role_name='Participant'
+        d=request.form; name=d.get('name','').strip(); email=d.get('email','').strip().lower(); phone=d.get('phone','').strip(); password=d.get('password',''); role_name=d.get('role','Participant')
+        if role_name not in ('Organizer','Volunteer','Participant'):
+            flash('Choose a valid account type.','danger'); return redirect(url_for('self_register'))
         if not name or not email or len(password)<8:
             flash('Name and email are required; password must be at least 8 characters.','danger'); return redirect(url_for('self_register'))
         conn=db()
         try:
             role=conn.execute('SELECT role_id FROM roles WHERE name=?',(role_name,)).fetchone()
-            verified = 0
+            verified = 0 if email_configured() else 1
             uid=conn.execute('INSERT INTO users(name,email,phone,password_hash,role_id,email_verified) VALUES (?,?,?,?,?,?)',(name,email,phone,generate_password_hash(password),role['role_id'],verified)).lastrowid
             conn.execute('INSERT INTO user_profiles(user_id,bio,date_of_birth,address,college,department,organization_name,website,education,experience,skills,availability,emergency_contact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,d.get('bio'),d.get('date_of_birth'),d.get('address'),d.get('college'),d.get('department'),d.get('organization_name'),d.get('website'),d.get('education'),d.get('experience'),d.get('skills'),d.get('availability'),d.get('emergency_contact')))
             if role_name=='Organizer':
@@ -1093,17 +1040,15 @@ def self_register():
                 conn.execute('INSERT INTO participants(user_id,name,email,phone,dob,college_name,department,address) VALUES (?,?,?,?,?,?,?,?)',(uid,name,email,phone,d.get('date_of_birth'),d.get('college'),d.get('department'),d.get('address')))
                 conn.execute('INSERT INTO participant_profiles(user_id,date_of_birth,college,department,address,emergency_contact) VALUES (?,?,?,?,?,?)',(uid,d.get('date_of_birth'),d.get('college'),d.get('department'),d.get('address'),d.get('emergency_contact')))
             conn.commit()
-            if smtp_configured():
+            if email_configured():
                 try:
                     send_email_otp(uid,email)
                     flash('Account created. Check your email for a 6-digit verification code.', 'success')
                     return redirect(url_for('verify_email', email=email))
                 except Exception as mail_error:
-                    app.logger.exception('Registration OTP email delivery failed')
-                    flash('Account created, but email delivery failed. Check SMTP settings and use Resend code.', 'warning')
+                    flash('Account created, but email delivery failed. Check Resend settings and request a new code: '+str(mail_error), 'warning')
                     return redirect(url_for('verify_email', email=email))
-            flash('Email verification is required. Configure SMTP in your private .env before creating an account.', 'danger')
-            return redirect(url_for('verify_email', email=email))
+            flash('Account created. Email verification is skipped because SMTP is not configured.', 'success'); return redirect(url_for('login'))
         except sqlite3.IntegrityError:
             conn.rollback(); flash('That email address is already registered.','danger')
         except Exception as exc:
@@ -1165,7 +1110,7 @@ def google_callback():
 def verify_email():
     email=request.values.get('email','').strip().lower()
     if request.method=='POST':
-        email=request.form.get('email','').strip().lower(); code=(request.form.get('code') or request.form.get('otp') or '').strip()
+        email=request.form.get('email','').strip().lower(); code=request.form.get('code','').strip()
         user=query('SELECT user_id,email_verified FROM users WHERE lower(email)=?',(email,),one=True)
         if not user: flash('No account found for that email.','danger')
         elif user['email_verified']: flash('This email is already verified. Please sign in.','success'); return redirect(url_for('login'))
@@ -1181,61 +1126,14 @@ def verify_email():
 
 @app.route('/verify-email/resend', methods=['POST'])
 def resend_email_otp():
-    email=request.form.get('email') or request.args.get('email',''); email=email.strip().lower(); user=query('SELECT user_id,email_verified FROM users WHERE lower(email)=?',(email,),one=True)
-    if not smtp_configured(): flash('SMTP is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD and SMTP_FROM in .env.', 'warning')
+    email=request.form.get('email','').strip().lower(); user=query('SELECT user_id,email_verified FROM users WHERE lower(email)=?',(email,),one=True)
+    if not email_configured(): flash('Resend is not configured. Set RESEND_API_KEY and EMAIL_FROM in Render Environment.', 'warning')
     elif not user: flash('No account found for that email.', 'danger')
     elif user['email_verified']: flash('Email already verified. Please sign in.', 'success')
     else:
         try: send_email_otp(user['user_id'],email); flash('A new verification code was sent.', 'success')
-        except Exception:
-            app.logger.exception('Resending verification OTP failed')
-            flash('Email delivery failed. Check SMTP settings and try again later.', 'danger')
+        except Exception as exc: flash('Email send failed: '+str(exc), 'danger')
     return redirect(url_for('verify_email',email=email))
-
-@app.route('/forgot-password', methods=['GET','POST'])
-def forgot_password():
-    if request.method == 'POST':
-        email = request.form.get('email','').strip().lower()
-        user = query('SELECT user_id,email_verified FROM users WHERE lower(email)=?', (email,), one=True)
-        if not user:
-            flash('If that account exists, a reset code can be sent to its email.', 'info')
-            return redirect(url_for('forgot_password'))
-        if not user['email_verified']:
-            flash('Verify your email before resetting your password.', 'warning')
-            return redirect(url_for('verify_email', email=email))
-        if not smtp_configured():
-            flash('Password reset email is unavailable. Configure SMTP in your private .env.', 'danger')
-            return redirect(url_for('forgot_password'))
-        code = f'{secrets.randbelow(1000000):06d}'
-        try:
-            if not send_email(email, 'EFMS password reset code', f'Your EFMS password reset code is {code}. It expires in 10 minutes.'):
-                raise RuntimeError('SMTP is not configured.')
-            execute('UPDATE password_reset_otps SET used_at=? WHERE user_id=? AND used_at IS NULL', (datetime.utcnow().isoformat(), user['user_id']))
-            execute('INSERT INTO password_reset_otps(user_id,code_hash,expires_at) VALUES (?,?,?)', (user['user_id'], generate_password_hash(code), (datetime.utcnow()+timedelta(minutes=10)).isoformat()))
-            flash('A password reset code has been sent to your email.', 'success')
-            return redirect(url_for('reset_password', email=email))
-        except Exception:
-            app.logger.exception('Password reset email failed')
-            flash('Could not send the reset code. Check your email configuration.', 'danger')
-    return render_template('forgot_password.html')
-
-@app.route('/reset-password', methods=['GET','POST'])
-def reset_password():
-    email = (request.values.get('email') or '').strip().lower()
-    if request.method == 'POST':
-        code = request.form.get('code','').strip(); password = request.form.get('password','')
-        user = query('SELECT user_id FROM users WHERE lower(email)=?', (email,), one=True)
-        otp = query('SELECT * FROM password_reset_otps WHERE user_id=? AND used_at IS NULL ORDER BY reset_id DESC LIMIT 1', (user['user_id'],), one=True) if user else None
-        if not user or not otp or datetime.fromisoformat(otp['expires_at']) < datetime.utcnow() or not check_password_hash(otp['code_hash'], code):
-            flash('The reset code is invalid or expired.', 'danger')
-        elif len(password) < 8:
-            flash('Choose a password with at least 8 characters.', 'danger')
-        else:
-            execute('UPDATE users SET password_hash=? WHERE user_id=?', (generate_password_hash(password), user['user_id']))
-            execute('UPDATE password_reset_otps SET used_at=? WHERE reset_id=?', (datetime.utcnow().isoformat(), otp['reset_id']))
-            flash('Password updated. You can now sign in.', 'success')
-            return redirect(url_for('login'))
-    return render_template('reset_password.html', email=email)
 
 @app.route('/browse-events')
 def browse_events():
@@ -1356,11 +1254,11 @@ def portal_register_event(event_id):
         conn.commit(); audit('REGISTER','Event',event_id,'participant='+str(uid)+'; demo payment')
         email_row=conn.execute('SELECT email,name FROM users WHERE user_id=?',(uid,)).fetchone()
         email_sent=False
-        if smtp_configured():
+        if email_configured():
             try: email_sent=send_email(email_row['email'],'EFMS demo ticket confirmation: '+event['event_name'],f"Hello {email_row['name']},\n\nThis is a DEMO ticket confirmation for {event['event_name']}. No real money was charged. Demo reference: {demo_reference}. Ticket IDs:\n"+'\n'.join(codes)+'\n\nSign in to EFMS to download your QR codes.')
             except Exception: app.logger.exception('Demo ticket email failed')
         issued_tickets=query('SELECT ticket_id,ticket_no FROM tickets WHERE registration_id=? ORDER BY ticket_id',(reg,))
-        return render_template('demo_payment_success.html',event_name=event['event_name'],registration_id=reg,amount=amount,reference=demo_reference,tickets=issued_tickets,email_sent=email_sent,email_configured=smtp_configured())
+        return render_template('demo_payment_success.html',event_name=event['event_name'],registration_id=reg,amount=amount,reference=demo_reference,tickets=issued_tickets,email_sent=email_sent,email_configured=email_configured())
     except Exception as exc:
         conn.rollback(); flash(str(exc),'danger')
     finally: conn.close()
@@ -1400,18 +1298,12 @@ def razorpay_verify():
     finally: conn.close()
 
 @app.route('/portal/volunteer/apply/<int:event_id>',methods=['POST'])
-@login_required
+@role_required('Volunteer')
 def volunteer_apply(event_id):
     conn=db()
     try:
         vol=conn.execute('SELECT volunteer_id FROM volunteers WHERE user_id=?',(session['user_id'],)).fetchone()
-        if not vol:
-            u=conn.execute('SELECT name,email,phone FROM users WHERE user_id=?',(session['user_id'],)).fetchone()
-            conn.execute('INSERT INTO volunteers(user_id,name,phone,email,availability_status,status) VALUES (?,?,?,?,?,?)',(session['user_id'],u['name'],u['phone'],u['email'],'Available','Active'))
-            vol=conn.execute('SELECT volunteer_id FROM volunteers WHERE user_id=?',(session['user_id'],)).fetchone()
-        event=conn.execute("SELECT event_id,organizer_user_id FROM events WHERE event_id=? AND status='Published'",(event_id,)).fetchone()
-        if not event: raise ValueError('Published event not found.')
-        if event['organizer_user_id'] == session['user_id']: raise ValueError('An event host cannot volunteer for their own event.')
+        if not vol or not conn.execute("SELECT 1 FROM events WHERE event_id=? AND status='Published'",(event_id,)).fetchone(): raise ValueError('Volunteer profile or published event not found.')
         conn.execute('INSERT INTO volunteer_applications(volunteer_id,event_id,message,status) VALUES (?,?,?,?)',(vol['volunteer_id'],event_id,request.form.get('message'),'Pending')); conn.commit(); flash('Application sent to the organizer.','success')
     except sqlite3.IntegrityError: conn.rollback(); flash('You already applied for this event.','warning')
     except Exception as exc: conn.rollback(); flash(str(exc),'danger')
@@ -1476,16 +1368,10 @@ def server_error(e):
     return render_template('error.html', code=500, message='Unexpected server error.'), 500
 
 
-
-# Initialize database when the application starts,
-# including when launched through Gunicorn on Render.
+# Gunicorn imports this module instead of executing it as __main__, so
+# initialize/migrate the SQLite schema during application startup as well.
 init_db()
 print('EFMS database ready:', DB_PATH)
 
 if __name__ == '__main__':
-    app.run(
-        debug=DEBUG,
-        host='0.0.0.0',
-        port=int(os.getenv('PORT', '5000'))
-    )
-
+    app.run(debug=DEBUG, host='0.0.0.0', port=int(os.getenv('PORT', '5000')))
