@@ -5,3 +5,4 @@ razorpay>=1.4
 Pillow>=10.0
 
 gunicorn
+resend
