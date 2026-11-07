@@ -1468,8 +1468,16 @@ def server_error(e):
     return render_template('error.html', code=500, message='Unexpected server error.'), 500
 
 
+
+# Initialize database when the application starts,
+# including when launched through Gunicorn on Render.
+init_db()
+print('EFMS database ready:', DB_PATH)
+
 if __name__ == '__main__':
-    init_db()
-    print('EFMS database ready:', DB_PATH)
-    print('Demo accounts: admin@efms.local/admin123 | organizer@efms.local/org123 | participant@efms.local/part123 | volunteer@efms.local/vol123 | sponsor@efms.local/sponsor123')
-    app.run(debug=DEBUG, host='127.0.0.1', port=int(os.getenv('PORT', '5000')))
+    app.run(
+        debug=DEBUG,
+        host='0.0.0.0',
+        port=int(os.getenv('PORT', '5000'))
+    )
+
